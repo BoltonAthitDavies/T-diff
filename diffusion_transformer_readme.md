@@ -95,6 +95,22 @@ Its job is to predict either the added noise or the clean sample target, dependi
 
 That means the model is trained to predict the noise that was added to the clean trajectory.
 
+### Exact model size used in the Gibson config
+
+The main training config uses the following Transformer settings:
+
+- `n_layer: 8`
+- `n_cond_layers: 0`
+- `n_head: 4`
+- `n_emb: 256`
+- `p_drop_emb: 0.0`
+- `p_drop_attn: 0.3`
+- `causal_attn: True`
+- `time_as_cond: True`
+- `obs_as_cond: True`
+
+So the denoiser is an 8-layer Transformer decoder with 4 attention heads and embedding width 256.
+
 ### Token structure
 
 There are two streams in the Transformer:
@@ -127,6 +143,49 @@ encoded_condition = condition_encoder(condition tokens)
 denoised_features = transformer_decoder(trajectory tokens, memory=encoded_condition)
 predicted_noise = linear_head(denoised_features)
 ```
+
+### Activation functions and normalization
+
+The Transformer implementation uses several different nonlinearities depending on the submodule.
+
+- Diffusion timestep embedding: sinusoidal positional embedding via `SinusoidalPosEmb`
+- Condition encoder with `n_cond_layers=0`: `Linear -> Mish -> Linear`
+- Transformer encoder layers: `activation='gelu'`
+- Transformer decoder layers: `activation='gelu'`
+- Final output normalization: `LayerNorm`
+
+The code also sets `norm_first=True` in the Transformer encoder and decoder layers, which means it uses pre-norm blocks. That is usually more stable for deeper Transformer training.
+
+### Attention pattern
+
+With `causal_attn=True`, the trajectory tokens use a causal self-attention mask. This means each future waypoint token can only attend to itself and earlier trajectory tokens, not later ones.
+
+When observation conditioning is enabled, the code also builds a memory mask for cross-attention so the trajectory tokens attend to the conditioning tokens in a temporally structured way.
+
+### Embeddings and heads
+
+Inside `TransformerForDiffusion`:
+
+- The noisy trajectory input is projected with `nn.Linear(input_dim, n_emb)`
+- Learned position embeddings are stored in `pos_emb`
+- Conditioning position embeddings are stored in `cond_pos_emb`
+- The final output head is `nn.Linear(n_emb, output_dim)`
+
+For this model:
+
+- `input_dim = 2` because each trajectory step is an `(x, y)` point
+- `output_dim = 2` because the model predicts noise for that same 2D point sequence
+- `cond_dim = 533` because the condition token is `[loc, target, map_feature]`
+
+### What `n_cond_layers=0` means here
+
+This is an important detail. The conditioning branch is not using a deep Transformer encoder in the Gibson config. Instead, the time token and observation token are passed through a lightweight MLP-style encoder:
+
+```text
+Linear(256 -> 1024) -> Mish -> Linear(1024 -> 256)
+```
+
+So most of the modeling capacity is concentrated in the 8-layer Transformer decoder that denoises the trajectory tokens.
 
 ## 6. Training objective
 
@@ -191,14 +250,73 @@ Key values:
 - `num_train_timesteps: 100`
 - `num_inference_steps: 100`
 - `n_layer: 8`
+- `n_cond_layers: 0`
 - `n_head: 4`
 - `n_emb: 256`
+- `p_drop_emb: 0.0`
+- `p_drop_attn: 0.3`
 - `causal_attn: True`
+- `time_as_cond: True`
 - `obs_as_cond: True`
 
 These settings mean the model predicts a 28-step future 2D path while conditioning on one observation step.
 
-## 9. Data flow through the repo
+## 9. Optimization and training hyperparameters
+
+The training setup in `train_traj/train_diffusion_traj_gibson.yaml` uses:
+
+- Optimizer: `AdamW`
+- Learning rate: `1e-4`
+- Betas: `(0.9, 0.95)`
+- Transformer weight decay: `1e-3`
+- Observation encoder weight decay: `1e-6`
+- LR scheduler: `cosine`
+- Warmup steps: `1000`
+- Batch size: `512`
+- Validation batch size: `512`
+- Epochs: `1000`
+- Gradient accumulation: `1`
+- EMA enabled: `true`
+
+The EMA configuration is:
+
+- `inv_gamma: 1.0`
+- `power: 0.75`
+- `min_value: 0.0`
+- `max_value: 0.9999`
+- `update_after_step: 0`
+
+This means the training loop keeps both:
+
+- the live model being optimized by AdamW
+- an exponential moving average copy for more stable evaluation and checkpointing
+
+### Scheduler details
+
+The diffusion noise scheduler is `DDPMScheduler` with:
+
+- `beta_start: 0.0001`
+- `beta_end: 0.02`
+- `beta_schedule: squaredcos_cap_v2`
+- `clip_sample: true`
+- `variance_type: fixed_small`
+- `prediction_type: epsilon`
+- `num_train_timesteps: 100`
+
+So the model is trained with 100 diffusion steps and, by default, also sampled with 100 reverse denoising steps.
+
+### Training loop behavior
+
+The workspace config also specifies:
+
+- `val_every: 1`
+- `checkpoint_every: 10`
+- `sample_every: 5`
+- `rollout_every: 50`
+
+So during long runs the model is validated every epoch, sampled periodically, and checkpointed every 10 epochs.
+
+## 10. Data flow through the repo
 
 If you want to follow the architecture through the codebase, this is the shortest path:
 
@@ -215,7 +333,7 @@ If you want to follow the architecture through the codebase, this is the shortes
 6. `semexp/eval_tdiff.py`
    - evaluation-time integration into navigation
 
-## 10. Why this architecture makes sense for ObjectNav
+## 11. Why this architecture makes sense for ObjectNav
 
 This model is a good fit for ObjectNav for three reasons:
 
@@ -225,7 +343,7 @@ This model is a good fit for ObjectNav for three reasons:
 
 In practice, this gives the planner a smoother and more globally coherent guide trajectory.
 
-## 11. One implementation detail to remember
+## 12. One implementation detail to remember
 
 There are two similar policy stacks in this repository:
 
@@ -234,7 +352,7 @@ There are two similar policy stacks in this repository:
 
 For understanding the training setup described by the Gibson config, the `train_traj/trajectory_diffusion/...` path is the primary one. The `diffusion_policy/...` path contains closely related policy code used by the evaluation stack.
 
-## 12. Short mental model
+## 13. Short mental model
 
 You can think about the model as:
 
