@@ -1,5 +1,8 @@
 # Trajectory Diffusion for ObjectGoal Navigation
 
+## Documentation
+- See [diffusion_transformer_readme.md](diffusion_transformer_readme.md) for a code-oriented explanation of the diffusion transformer and trajectory model architecture used in this repository.
+
 ## Setup
 - Clone the repository and move into the top-level directory `cd T-Diff`
 - Create conda environment. `conda env create -f environment.yml`
